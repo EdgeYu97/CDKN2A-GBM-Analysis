@@ -1,0 +1,197 @@
+ ---
+title: "Joining RNA-seq and CNV status"
+author: "Edge Yu"
+date: "2025-10-12"
+output: html_document
+---
+
+```{r}
+knitr::opts_knit$set(root.dir = normalizePath("E:/R Projects Data/"))
+```
+
+```{r}
+# --- fresh session recommended ---
+rm(list = ls())
+```
+
+```{r}
+
+# If you need any of these:
+# install.packages(c("tidyverse","data.table"))
+
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(TCGAutils)
+library(DESeq2)
+library(fgsea)
+library(org.Hs.eg.db)
+library(tidyverse)  # dplyr/tidyr/readr etc.
+
+set.seed(123)
+
+```
+
+```{r}
+# Detect GDC UUIDs (36 chars with 4 hyphens)
+is_uuid <- function(x) {
+  x <- as.character(x)
+  all(!is.na(x) & grepl("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", x, ignore.case = TRUE))
+}
+```
+
+```{R}
+# Extract TCGA IDs
+get_case_id   <- function(x) TCGAutils::TCGAbarcode(x, participant = TRUE)  # 12-char, e.g., "TCGA-06-0156"
+get_sample_id <- function(x) substr(x, 1, 16)    
+```
+
+```{R}
+# Deterministic choice inside a group of barcodes:
+# prefer analyte H > R > T, then higher plate number, then lexicographic barcode
+pick_one_barcode <- function(barcodes) {
+  bio <- TCGAbiospec(barcodes)
+  plate <- suppressWarnings(as.integer(bio$plate))
+  analyte_rank <- match(bio$analyte, c("H","R","T"), nomatch = 99)
+  o <- order(analyte_rank, -plate, barcodes)
+  barcodes[o][1]
+}
+```
+
+
+```{r}
+# Adjust paths to your files
+cnv_dd <- read.delim("E:/R Projects Data/GDCdata/TCGA-GBM/cdkn2a_deepDeletion_unambiguous_UUID.tsv",   check.names = FALSE, stringsAsFactors = FALSE)
+cnv_nd <- read.delim("E:/R Projects Data/GDCdata/TCGA-GBM/cdkn2a_nonDeletion_unambiguous_ge2_UUID.tsv",   check.names = FALSE, stringsAsFactors = FALSE)
+```
+
+```{R}
+# Sanity
+stopifnot(all(c("SampleID","CDKN2A_Copy") %in% names(cnv_dd)))
+stopifnot(is_uuid(cnv_dd$SampleID))  # should be TRUE given your description
+
+```
+
+```{r}
+cnv_query <- GDCquery(
+  project = "TCGA-GBM",
+  data.category = "Copy Number Variation",
+  data.type = "Gene Level Copy Number",
+  access = "open",
+  workflow.type = "ABSOLUTE LiftOver"
+)
+```
+
+```{R}
+cnv_meta <- getResults(cnv_query) %>%
+  dplyr::transmute(
+    cnv_file_id   = id,
+    cnv_barcode   = as.character(cases),
+    cnv_case_id   = get_case_id(cnv_barcode),
+    cnv_sample_id = get_sample_id(cnv_barcode),
+    cnv_sample_type = substr(cnv_barcode, 14, 15)  # "01"=Primary Tumor
+  )
+```
+
+```{r}
+# Attach barcodes to your three CNV groups by UUID
+attach_meta <- function(tbl) {
+  tbl %>%
+    dplyr::left_join(cnv_meta, by = c("SampleID" = "cnv_file_id")) %>%
+    dplyr::filter(!is.na(cnv_barcode)) %>%              # keep only those that matched metadata
+    dplyr::filter(cnv_sample_type == "01") %>%          # Primary Tumor only
+    dplyr::mutate(
+      group_cnv = dplyr::case_when(
+        CDKN2A_Copy == 0              ~ "DD",
+        CDKN2A_Copy >= 2              ~ "ND",
+        TRUE                            ~ NA_character_
+      )
+    )
+}
+```
+
+```{r}
+dd_cnv <- attach_meta(cnv_dd)
+nd_cnv <- attach_meta(cnv_nd)
+```
+
+```{r}
+# Combine and keep only DD and ND for this analysis (exclude SD)
+cnv_calls <- bind_rows(dd_cnv, nd_cnv) %>%
+  dplyr::select(cnv_barcode, cnv_case_id, cnv_sample_id, group_cnv) %>%
+  dplyr::distinct()
+
+```
+
+```{R}
+# Quick look at per-group case counts (case-level)
+cnv_case_counts <- cnv_calls %>%
+  dplyr::count(group_cnv, cnv_case_id, name = "n_per_case") %>%
+  dplyr::count(group_cnv, name = "n_cases")
+
+cnv_case_counts
+```
+
+
+
+```{r}
+rna_query <- GDCquery(
+  project       = "TCGA-GBM",
+  data.category = "Transcriptome Profiling",
+  data.type     = "Gene Expression Quantification",
+  access = "Open",
+  workflow.type = "STAR - Counts",
+  sample.type = "Primary Tumor"
+)
+```
+```{R}
+rna_meta <- getResults(rna_query) %>%
+  transmute(
+    file_id         = id,                    # matches your RNA output "ID"
+    rna_barcode     = as.character(cases),
+    rna_case_id     = get_case_id(rna_barcode),
+    rna_sample_id   = get_sample_id(rna_barcode),
+    rna_sample_type = substr(rna_barcode, 14, 15)  # "01" = Primary Tumor
+  )
+```
+
+```{r}
+rna_goi <- readr::read_tsv(
+  "E:/R Projects Data/GDCdata/TCGA-GBM/tcga_gbm_tpm_unstranded_GOI.tsv",
+  show_col_types = FALSE, progress = FALSE
+) %>%
+  dplyr::rename(file_id = ID)
+```
+
+```{r}
+rna_long <- rna_goi %>%
+  dplyr::left_join(rna_meta, by = "file_id") %>%
+  dplyr::filter(!is.na(rna_barcode), rna_sample_type == "01") %>%
+  dplyr::select(rna_case_id, rna_sample_id, gene_name, tpm_unstranded)
+```
+
+```{r}
+rna_wide <- rna_long %>%
+  dplyr::group_by(rna_sample_id, gene_name) %>%
+  dplyr::summarise(tpm = mean(tpm_unstranded, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = gene_name, values_from = tpm)
+```
+
+```{R}
+# ---- Join with CNV calls (DD / ND) by sample_id ----
+final_expr_with_cnv <- cnv_calls %>%
+  dplyr::inner_join(rna_wide, by = c("cnv_sample_id" = "rna_sample_id")) %>%
+  # optional: arrange for readability
+  dplyr::arrange(group_cnv, cnv_case_id)
+
+# Peek
+dplyr::glimpse(final_expr_with_cnv)
+```
+
+```{r}
+summary(final_expr_with_cnv)
+```
+
+```{r}
+write.csv(final_expr_with_cnv, file = "final_expr_with_cnv.csv")
+```
+
